@@ -38,11 +38,21 @@ jobs:
       run: |
         mypy src/ || true
     
-    - name: Build Docker image
-      run: |
-        docker build -t gdrive-mcp-server:test .
-    
-    - name: Test Docker image
-      run: |
-        docker run --rm gdrive-mcp-server:test --help || true
-
+    - name: Bump Version and Push Tag
+      id: tag_version
+      uses: mathieudutour/github-tag-action@v6.0
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        default_bump: patch
+        tag_prefix: ""
+          
+    - name: Publish Image
+      uses: matootie/github-docker@v3.1.0
+      with:
+        accessToken: ${{ github.token }}
+        imageName: ${{ github.event.repository.name }}
+        contextName: Dockerfile
+        tag: |
+          latest
+          ${{ github.sha }}
+          ${{ steps.tag_version.outputs.new_tag }}
