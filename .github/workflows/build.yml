@@ -32,7 +32,7 @@ jobs:
     
     - name: Lint with ruff
       run: |
-        ruff check src/
+        ruff check src/ --fix
     
     - name: Type check with mypy
       run: |
