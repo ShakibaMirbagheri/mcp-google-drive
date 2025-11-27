@@ -1,18 +1,9 @@
-#!/usr/bin/env python3
-"""
-MCP server for Google Drive integration.
-This server exposes methods to interact with Google Drive files and folders.
-"""
-
-import os
-import sys
-import json
+"""Google Drive MCP Server implementation."""
 import io
 import pickle
 import argparse
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional
 from pathlib import Path
-
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -20,200 +11,117 @@ from googleapiclient.http import MediaIoBaseDownload
 from google.auth.exceptions import RefreshError
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-
-# Load environment variables
-load_dotenv()
-
-print("Starting Google Drive MCP server!")
-
 class GoogleDriveClient:
-    """Client for interacting with the Google Drive API."""
-
+    """Client for interacting with Google Drive."""
     def __init__(self, token_path: Optional[str] = None):
         """Initialize the Google Drive client.
-        
         Args:
             token_path: Path to the token file. If None, defaults to 'tokens.json' in current directory.
         """
-        self.SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-        self.token_path = Path(token_path) if token_path else Path('tokens.json')
-        self.service = self._get_service()
-
-    def _get_credentials(self) -> Credentials:
-        """Get credentials from the saved token file."""
-        if not self.token_path.exists():
-            raise FileNotFoundError(
-                f"Token file not found at {self.token_path}. "
-                "Please run auth_setup.py first to set up authentication."
-            )
-
+        self.SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+        self.token_path = Path(token_path or "tokens.json")
+        self.service = self._load_service()
+    def _load_service(self):
         suffix = self.token_path.suffix.lower()
-        
-        # Try to load based on extension, but fall back to other format if it fails
-        if suffix in {'.json'}:
-            try:
+        try:
+            if suffix == ".json":
                 creds = self._load_credentials_from_json()
-            except (UnicodeDecodeError, RuntimeError):
-                # File might actually be pickle despite .json extension
+            elif suffix == ".pickle":
                 creds = self._load_credentials_from_pickle()
-        elif suffix in {'.pickle', '.pkl'}:
-            try:
-                creds = self._load_credentials_from_pickle()
-            except (pickle.UnpicklingError, EOFError, RuntimeError):
-                # File might actually be JSON despite .pickle extension
-                creds = self._load_credentials_from_json()
-        else:
-            # Unknown extension - try both formats
-            try:
-                creds = self._load_credentials_from_json()
-            except (UnicodeDecodeError, RuntimeError):
-                try:
-                    creds = self._load_credentials_from_pickle()
-                except Exception:
-                    raise RuntimeError(
-                        f"Could not load token file '{self.token_path}'. "
-                        "Supported formats: .json, .pickle"
-                    )
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except RefreshError as e:
-                    raise RuntimeError(
-                        f"Error refreshing token: {e}. "
-                        "Please run auth_setup.py again to re-authenticate."
-                    )
             else:
                 raise RuntimeError(
-                    "Invalid or missing credentials. "
-                    "Please run auth_setup.py to set up authentication."
+                    f"Unsupported token file format: {suffix}. Expected .json or .pickle"
                 )
-
-        return creds
-
-    def _load_credentials_from_json(self) -> Credentials:
-        """Load credentials stored as JSON."""
+        except Exception as err:
+            raise RuntimeError(
+                f"Could not load token file '{self.token_path}'. "
+                "Supported formats: .json, .pickle"
+            ) from err
+        if not creds or not creds.valid:
+            try:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    raise RuntimeError(
+                        "Invalid or missing credentials. Please run auth_setup.py."
+                    )
+            except RefreshError as err:
+                raise RuntimeError(
+                    f"Error refreshing token: {err}. Please run auth_setup.py again to re-authenticate."
+                ) from err
+        return build("drive", "v3", credentials=creds)
+    def _load_credentials_from_json(self):
+        return Credentials.from_authorized_user_file(self.token_path, self.SCOPES)
+    def _load_credentials_from_pickle(self):
+        with self.token_path.open("rb") as f:
+            return pickle.load(f)
+    def search_files(self, query: str) -> dict[str, Any]:
+        """Search files in Google Drive."""
         try:
-            return Credentials.from_authorized_user_file(
-                str(self.token_path),
-                scopes=self.SCOPES,
+            results = (
+                self.service.files()
+                .list(
+                    q=query,
+                    fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                )
+                .execute()
             )
-        except Exception as e:
-            raise RuntimeError(f"Error loading token JSON file: {e}") from e
-
-    def _load_credentials_from_pickle(self) -> Credentials:
-        """Load credentials stored as a pickle."""
-        try:
-            with open(self.token_path, 'rb') as token:
-                return pickle.load(token)
-        except (pickle.UnpicklingError, EOFError) as e:
-            raise RuntimeError(f"Error loading token pickle file: {e}") from e
-
-    def _get_service(self):
-        """Get the Google Drive service instance."""
-        try:
-            creds = self._get_credentials()
-            return build('drive', 'v3', credentials=creds)
-        except Exception as e:
-            print(f"Error initializing Google Drive service: {e}")
-            raise
-
-    def search_files(
-        self,
-        query: str,
-        page_size: int = 10,
-        page_token: Optional[str] = None
-    ) -> dict:
-        """Search for files in Google Drive."""
-        try:
-            results = self.service.files().list(
-                q=f"name contains '{query}'",
-                pageSize=page_size,
-                pageToken=page_token,
-                fields="nextPageToken, files(id, name, mimeType, webViewLink)"
-            ).execute()
-            
             return self._format_search_response(results)
         except Exception as e:
-            return {"error": str(e)}
-
-    def get_file(self, file_id: str) -> dict:
-        """Get file content and metadata."""
+            raise RuntimeError(f"Error searching files: {e}") from e
+    def download_file(self, file_id: str) -> dict[str, Any]:
+        """Download a file from Google Drive."""
         try:
-            # Get file metadata
-            file_metadata = self.service.files().get(
-                fileId=file_id,
-                fields="id, name, mimeType, webViewLink"
-            ).execute()
-            
-            # Get file content
+            metadata = (
+                self.service.files()
+                .get(
+                    fileId=file_id,
+                    fields="id, name, mimeType, webViewLink",
+                )
+                .execute()
+            )
             request = self.service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, request)
             done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
+            while not done:
+                _, done = downloader.next_chunk()
             return {
                 "metadata": {
-                    "id": file_metadata['id'],
-                    "name": file_metadata['name'],
-                    "mime_type": file_metadata['mimeType'],
-                    "web_view_link": file_metadata['webViewLink']
+                    "id": metadata["id"],
+                    "name": metadata["name"],
+                    "mimeType": metadata["mimeType"],
+                    "webViewLink": metadata.get("webViewLink"),
                 },
-                "content": fh.getvalue().decode('utf-8')
+                "content": fh.getvalue(),
             }
         except Exception as e:
-            return {"error": str(e)}
-
-    def _format_search_response(self, response: dict) -> dict:
-        """Format the Google Drive search response."""
-        items = response.get('files', [])
+            raise RuntimeError(f"Error downloading file: {e}") from e
+    def _format_search_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        items = response.get("files", [])
         formatted_files = []
-        
         for item in items:
             formatted_file = {
-                "id": item['id'],
-                "name": item['name'],
-                "mime_type": item['mimeType'],
-                "web_view_link": item['webViewLink']
+                "id": item["id"],
+                "name": item["name"],
+                "mimeType": item["mimeType"],
+                "webViewLink": item.get("webViewLink"),
             }
             formatted_files.append(formatted_file)
-
-        return {
-            "files": formatted_files,
-            "next_page_token": response.get('nextPageToken')
-        }
-
-# Initialize MCP server
-mcp = FastMCP(name="Google Drive MCP Server", host="0.0.0.0", port=8000)
-
-@mcp.tool()
-def search_files(query: str, page_size: int = 10) -> dict[str, Any]:
-    """Search for files in Google Drive."""
-    return drive_client.search_files(query=query, page_size=page_size)
-
-@mcp.tool()
-def get_file(file_id: str) -> dict[str, Any]:
-    """Get file content and metadata."""
-    return drive_client.get_file(file_id=file_id)
-
-def main() -> None:
-    """Run the MCP server."""
-    parser = argparse.ArgumentParser(description='Google Drive MCP Server')
-    parser.add_argument('--http', action='store_true', help='Run in HTTP mode')
-    parser.add_argument('--token', type=str, help='Path to token file (default: tokens.json)')
+        return {"files": formatted_files}
+def main():
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Google Drive MCP Server")
+    parser.add_argument("--token", default="tokens.json", help="Path to token file")
     args = parser.parse_args()
-
-    # Initialize the drive client with the provided token path
-    global drive_client
-    drive_client = GoogleDriveClient(token_path=args.token)
-
-    if args.http:
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run(transport="stdio")
-
+    client = GoogleDriveClient(token_path=args.token)
+    mcp = FastMCP()
+    @mcp.command("search")
+    def search(query: str):
+        return client.search_files(query)
+    @mcp.command("download")
+    def download(file_id: str):
+        return client.download_file(file_id)
+    mcp.run()
 if __name__ == "__main__":
-    main() 
+    main()
